@@ -1,0 +1,271 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: SAML Metadata Sync
+Metadata: 
+  AWS::CloudFormation::Interface: 
+    ParameterGroups: 
+      - 
+        Label: 
+          default: "Parameter Store Settings"
+        Parameters: 
+          - ParameterPrefix
+          - ParameterName
+          - ParameterValue
+      - 
+        Label: 
+          default: "Lambda Function Settings"
+        Parameters: 
+          - LambdaSourceZipURL
+          - ExistingDestinationBucket
+          - DestinationKeyPrefix
+          - DestinationObject
+    ParameterLabels: 
+      ParameterPrefix: 
+        default: Parameter Store path prefix (i.e. folder path)
+      ParameterName:
+        default: Parameter Store item name
+      ParameterValue:
+        default: JSON value that defines the SAML metadata
+      LambdaSourceZipURL:
+        default: URL to zip file with Lambda function
+      ExistingDestinationBucket:
+        default: Existing Bucket to copy Lambda zip to
+      DestinationKeyPrefix:
+        default: Destination S3 key prefix (i.e. folder path)
+      DestinationObject:
+        default: Destination S3 file name to copy zip to
+Parameters:
+  ParameterPrefix:
+    Type: String
+    Default: /saml-metadata/iam
+    AllowedPattern: '^/[0-9a-zA-Z-_./]+$'
+  ParameterName:
+    Type: String
+    Default: login.austin
+    AllowedPattern: '^[0-9a-zA-Z-_.]+$'
+  ParameterValue:
+    Type: String
+    Default: |
+      {
+        "Name": "login.austin",
+        "Source": "https://login.austin.utexas.edu/FederationMetadata/2007-06/FederationMetadata.xml",
+        "Destination": "austin"
+      }
+  LambdaSourceZipURL:
+    Type: String
+    Default: https://github.com/utexas-its-eta/SyncSamlMetadata/releases/latest/download/sync_saml.zip
+    AllowedPattern: '^https*://.*'
+  ExistingDestinationBucket:
+    Type: String
+    AllowedPattern: '^([0-9a-zA-Z]+([0-9a-zA-Z-]*[0-9a-zA-Z])*|)$'
+    Default: ''
+  DestinationKeyPrefix:
+    AllowedPattern: '^[0-9a-zA-Z-_/]*$'
+    Default: sync_saml/
+    Type: String
+  DestinationObject:
+    Default: sync_saml.zip
+    AllowedPattern: '^[0-9a-zA-Z-_.]+$'
+    Type: String
+    
+Conditions:
+  NeedNewLambdaBucket: !Equals 
+    - Ref: ExistingDestinationBucket
+    - ''
+
+Resources:
+  SamlParameter:
+    Type: AWS::SSM::Parameter
+    Properties: 
+      DataType: text
+      Name: !Sub "${ParameterPrefix}/${ParameterName}"
+      Tier: Standard
+      Type: String
+      Value: !Ref ParameterValue
+  
+  LambdaZipsBucket:
+    Type: 'AWS::S3::Bucket'
+    Condition: NeedNewLambdaBucket
+  
+  CopyZips:
+    Type: 'Custom::CopyZips'
+    Properties:
+      ServiceToken: !GetAtt CopyZipsFunction.Arn
+      DestBucket: !If 
+        - NeedNewLambdaBucket
+        - !Ref LambdaZipsBucket
+        - !Ref ExistingDestinationBucket
+      SourceURLs:
+        - !Ref LambdaSourceZipURL
+      DestObjects:
+        - !Ref DestinationObject
+      Prefix: !Ref DestinationKeyPrefix
+
+  CopyZipsRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Path: /
+      Policies:
+        - PolicyName: lambda-copier
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:PutObject'
+                  - 's3:DeleteObject'
+                Resource:
+                  - !If 
+                    - NeedNewLambdaBucket
+                    - !Sub 'arn:aws:s3:::${LambdaZipsBucket}/${DestinationKeyPrefix}*'
+                    - !Sub >-
+                      arn:aws:s3:::${ExistingDestinationBucket}/${DestinationKeyPrefix}*
+
+  CopyZipsFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Description: Copies objects from a source S3 bucket to a destination
+      Handler: index.handler
+      Runtime: python3.8
+      Role: !GetAtt CopyZipsRole.Arn
+      Timeout: 240
+      Code:
+        ZipFile: |
+          import json
+          import logging
+          import threading
+          import boto3
+          import cfnresponse
+          import urllib.request
+
+          def copy_objects(source_urls, dest_bucket, prefix, objects):
+            s3 = boto3.client('s3')
+            for i in range(len(source_urls)):
+              key = prefix + objects[i]
+              req = urllib.request.Request(source_urls[i])
+              resp = urllib.request.urlopen(req)
+              print('copy_source: %s' %source_urls[i])
+              print('dest_bucket = %s'%dest_bucket)
+              print('dest_key = %s' %key)
+              s3.upload_fileobj(resp, dest_bucket, key) 
+
+          def delete_objects(bucket, prefix, objects):
+            s3 = boto3.client('s3')
+            objects = {'Objects': [{'Key': prefix + o} for o in objects]}
+            s3.delete_objects(Bucket=bucket, Delete=objects)
+
+          def timeout(event, context):
+            logging.error('Execution is about to time out, sending failure response to CloudFormation')
+            cfnresponse.send(event, context, cfnresponse.FAILED, {}, None)
+
+          def handler(event, context):
+            timer = threading.Timer((context.get_remaining_time_in_millis()
+                      / 1000.00) - 0.5, timeout, args=[event, context])
+            timer.start()
+
+            print('Received event: %s' % json.dumps(event))
+            status = cfnresponse.SUCCESS
+
+            try:
+              source_urls = event['ResourceProperties']['SourceURLs']
+              dest_bucket = event['ResourceProperties']['DestBucket']
+              prefix = event['ResourceProperties']['Prefix']
+              objects = event['ResourceProperties']['DestObjects']
+              print('source_urls: %s, objects: %s' % ( len(source_urls), len(objects)))
+              assert len(source_urls) == len(objects)
+              if event['RequestType'] == 'Delete':
+                  delete_objects(dest_bucket, prefix, objects)
+              else:
+                  copy_objects(source_urls, dest_bucket, prefix, objects)
+            except Exception as e:
+              logging.error('Exception: %s' % e, exc_info=True)
+              status = cfnresponse.FAILED
+            finally:
+              timer.cancel()
+              cfnresponse.send(event, context, status, {}, None)
+
+  SyncSamlLambdaPolicy:
+    Type: 'AWS::IAM::ManagedPolicy'
+    Properties:
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - iam:CreateSAMLProvider
+              - iam:GetSAMLProvider
+              - iam:ListSAMLProviders
+              - iam:UpdateSAMLProvider
+              - ssm:DescribeParameters
+            Resource: '*'
+          - Effect: Allow
+            Action:
+              - ssm:GetParametersByPath
+              - ssm:GetParameters
+              - ssm:GetParameter
+            Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${ParameterPrefix}/*
+  
+  SyncSamlLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !Ref SyncSamlLambdaPolicy
+  
+  SyncSamlLambda:
+    DependsOn: CopyZips
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Syncs SAML metadata from a metadata URL in Parameter Store
+      Handler: sync_saml.lambda_handler
+      Runtime: python3.8
+      Role: !GetAtt 'SyncSamlLambdaRole.Arn'
+      Timeout: 300
+      Environment:
+        Variables:
+          ParameterPrefix: !Sub "${ParameterPrefix}/"
+      Code:
+        S3Bucket:
+          !If
+            - NeedNewLambdaBucket
+            - !Ref LambdaZipsBucket
+            - !Ref ExistingDestinationBucket
+        S3Key: !Sub '${DestinationKeyPrefix}${DestinationObject}'
+
+  SyncSamlSchedule:
+    Type: AWS::Events::Rule
+    Properties: 
+      Description: Run every day
+      ScheduleExpression: rate(1 day)
+      State: ENABLED
+      Targets: 
+        - Arn: !GetAtt SyncSamlLambda.Arn
+          Id: SyncSamlLambda
+
+  SyncSamlEventPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt SyncSamlLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt SyncSamlSchedule.Arn
+  
+  SyncSamlFirstRun:
+    Type: 'Custom::SyncSamlFirstRun'
+    Properties:
+      ServiceToken: !GetAtt SyncSamlLambda.Arn
