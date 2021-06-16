@@ -11,10 +11,10 @@ ZIPFile="$(realpath "$ZIPFile")"
 pushd $SCRIPTDIR/.. > /dev/null
 # Lambda comes with boto3 and others
 # lambdarequirements only packages other things
-pip install -r $LAMBDAFOLER/lambdarequirements.txt --target ./package
+pip install -r $LAMBDAFOLDER/lambdarequirements.txt --target ./package
 cd package
 zip -r $ZIPFile .
-cd ../$LAMBDAFOLER
+cd ../$LAMBDAFOLDER
 zip -rg $ZIPFile .
 cd ..
 rm -rf package
